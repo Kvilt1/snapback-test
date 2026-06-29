@@ -1,4 +1,4 @@
-import colorsys, hashlib, json, os, re, shutil, struct, sys, time, xml.etree.ElementTree as ET, zipfile
+import bisect, calendar, colorsys, gc, hashlib, json, logging, os, re, shutil, struct, sys, xml.etree.ElementTree as ET, zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
@@ -17,6 +17,7 @@ AVATAR_SIZE = 54
 _GHOST_SVG = Path(__file__).parent / "ghost.svg"
 GHOST_PATH = ET.parse(_GHOST_SVG).find(".//{http://www.w3.org/2000/svg}path").get("d")
 SVG_NS = {"svg": "http://www.w3.org/2000/svg", "xlink": "http://www.w3.org/1999/xlink"}
+LOGGER = logging.getLogger(__name__)
 
 
 class Progress:
@@ -52,7 +53,7 @@ def get_mtime(info):
         if tag == 0x5455 and size >= 5 and extra[i] & 1:
             return struct.unpack_from("<I", extra, i + 1)[0]
         i += size
-    return time.mktime(info.date_time + (0, 0, -1))
+    return calendar.timegm(info.date_time + (0, 0, -1))
 
 
 def extract_zips(input_dir, tmp_dir, progress):
@@ -106,8 +107,26 @@ def load_display_names(json_dir):
             for cat in data.values() if isinstance(cat, list)
             for e in cat if isinstance(e, dict) and "Username" in e
         }
-    except Exception:
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        LOGGER.warning("Unable to load display names from %s: %s", path, exc)
         return {}
+
+
+def load_history_json(json_dir, filename):
+    """Load an optional Snapchat history file, returning an empty history if absent."""
+    path = json_dir / filename
+    if not path.exists():
+        LOGGER.warning("%s was not found; continuing with an empty history.", path)
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Unable to load %s; continuing with an empty history: %s", path, exc)
+        return {}
+    if not isinstance(data, dict):
+        LOGGER.warning("%s did not contain a conversation object; continuing with an empty history.", path)
+        return {}
+    return data
 
 
 def find_owner(chat_data, snap_data):
@@ -156,6 +175,47 @@ def build_days(chat_data, snap_data):
     return days, usernames, group_info, group_titles
 
 
+def _build_message_index(days):
+    """Build sorted timestamp indexes per day for fast media matching."""
+    indexes = {}
+    for day, day_convs in days.items():
+        entries = []
+        for msgs in day_convs.values():
+            msgs.sort(key=lambda x: x.get("Created(microseconds)", 0))
+            entries.extend((m.get("Created(microseconds)", 0), m) for m in msgs)
+        entries.sort(key=lambda x: x[0])
+        indexes[day] = {
+            "timestamps": [timestamp for timestamp, _ in entries],
+            "messages": [message for _, message in entries],
+        }
+    return indexes
+
+
+def _closest_message(index, mtime_ms):
+    """Return the closest indexed message to mtime_ms using binary search."""
+    timestamps = index["timestamps"]
+    if not timestamps:
+        return None, float("inf"), float("inf")
+
+    window_start = bisect.bisect_left(timestamps, mtime_ms - TIMESTAMP_MATCH_THRESHOLD)
+    window_end = bisect.bisect_right(timestamps, mtime_ms + TIMESTAMP_MATCH_THRESHOLD)
+    candidates = range(window_start, window_end)
+    if window_start == window_end:
+        pos = bisect.bisect_left(timestamps, mtime_ms)
+        candidates = (pos - 1, pos)
+
+    best, best_diff, best_real = None, float("inf"), float("inf")
+    for candidate in candidates:
+        if not 0 <= candidate < len(timestamps):
+            continue
+        message = index["messages"][candidate]
+        real_diff = abs(timestamps[candidate] - mtime_ms)
+        ranked_diff = real_diff + len(message.get("media_filenames", [])) * MEDIA_PENALTY
+        if ranked_diff < best_diff:
+            best, best_diff, best_real = message, ranked_diff, real_diff
+    return best, best_diff, best_real
+
+
 def match_media(days, media_dir, progress):
     """Scan media, pair overlays by mtime bucket, match all files to messages by timestamp."""
     media_files, overlay_files = [], []
@@ -180,24 +240,29 @@ def match_media(days, media_dir, progress):
             if ovs:
                 overlay_pairs[m.name] = ovs[i % len(ovs)]
 
-    # Sort messages then match each file to closest message by timestamp
-    for day_convs in days.values():
-        for msgs in day_convs.values():
-            msgs.sort(key=lambda x: x.get("Created(microseconds)", 0))
+    # Sort and flatten messages once so each media file can match via binary search.
+    indexes = _build_message_index(days)
 
     matched = 0
     progress.phase(len(media_files))
     for f in media_files:
-        day, mtime_ms = f.name[:10], int(f.stat().st_mtime * 1000)
+        try:
+            media_day = date.fromisoformat(f.name[:10])
+        except ValueError:
+            LOGGER.warning("Skipping media file with an invalid date prefix: %s", f.name)
+            progress.update(1)
+            continue
+
+        mtime_ms = int(f.stat().st_mtime * 1000)
         best, best_diff, best_real = None, float("inf"), float("inf")
         for offset in (0, -1, 1):
-            target = str(date.fromisoformat(day) + timedelta(offset))
-            for msgs in days.get(target, {}).values():
-                for m in msgs:
-                    real_diff = abs(m.get("Created(microseconds)", 0) - mtime_ms)
-                    ranked_diff = real_diff + len(m.get("media_filenames", [])) * MEDIA_PENALTY
-                    if ranked_diff < best_diff:
-                        best, best_diff, best_real = m, ranked_diff, real_diff
+            target = str(media_day + timedelta(offset))
+            candidate, ranked_diff, real_diff = _closest_message(
+                indexes.get(target, {"timestamps": [], "messages": []}),
+                mtime_ms,
+            )
+            if ranked_diff < best_diff:
+                best, best_diff, best_real = candidate, ranked_diff, real_diff
         if best and best_real <= TIMESTAMP_MATCH_THRESHOLD:
             best.setdefault("media_filenames", []).append(f.name)
             matched += 1
@@ -350,7 +415,8 @@ def _fetch_avatar(username):
             f'<image href="{href}" x="0" y="0" width="{AVATAR_SIZE}" height="{AVATAR_SIZE}"/>'
             f'</svg>'
         )
-    except Exception:
+    except (requests.RequestException, ET.ParseError, ValueError) as exc:
+        LOGGER.warning("Unable to fetch Bitmoji for %s: %s", username, exc)
         return username, _fallback_svg(username)
 
 
@@ -374,6 +440,7 @@ def generate_bitmoji_assets(usernames, output_root, progress=None):
 
 
 def main():
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     input_dir, tmp_dir = Path("input"), Path("_tmp_extract")
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
@@ -383,11 +450,13 @@ def main():
 
     json_dir = tmp_dir / "json"
     media_dir = tmp_dir / "chat_media"
-    chat_data = json.loads((json_dir / "chat_history.json").read_text(encoding="utf-8"))
-    snap_data = json.loads((json_dir / "snap_history.json").read_text(encoding="utf-8"))
+    chat_data = load_history_json(json_dir, "chat_history.json")
+    snap_data = load_history_json(json_dir, "snap_history.json")
 
     owner = find_owner(chat_data, snap_data)
     days, usernames, group_info, group_titles = build_days(chat_data, snap_data)
+    del chat_data, snap_data
+    gc.collect()
     usernames.add(owner)
 
     media_files, overlay_pairs, matched = match_media(days, media_dir, progress)
