@@ -479,11 +479,23 @@ def main():
     )
     progress.close()
 
-    print(f"Detected Account Owner: {owner}")
-    print(f"Done. {total_files} day files across {len(days)} days.")
-    print(f"Media matched: {matched}/{len(media_files)} ({matched/max(len(media_files),1)*100:.1f}%)")
-
     shutil.rmtree(tmp_dir)
+    min_date, max_date = min(days.keys()), max(days.keys())
+    len_days, total_media = len(days), len(media_files)
+    orphaned = total_media - matched
+    matched_pct = matched / max(total_media, 1) * 100
+    orphaned_pct = orphaned / max(total_media, 1) * 100
+
+    print(f"{'=' * 80}\n{'SNAPCHAT EXPORT PROCESSING COMPLETE':^80}\n{'=' * 80}\n")
+    print(f"OVERVIEW\n{'-' * 80}")
+    print(f"{'Account Owner':<19}: {owner}")
+    print(f"{'Date Range':<19}: {min_date} to {max_date}")
+    print(f"{'Total Parsed':<19}: {total_files} day files across {len_days} active days\n")
+    print(f"MEDIA MATCHING\n{'-' * 80}")
+    print(f"{'Matched Media':<19}: {matched} / {total_media} ({matched_pct:.1f}%)")
+    print(f"{'Orphaned Media':<19}: {orphaned} files ({orphaned_pct:.1f}%) - safely copied to 'orphaned' folders\n")
+    print(f"{'=' * 80}")
+    print("Done! All files successfully written to the 'output' directory.")
 
 
 if __name__ == "__main__":

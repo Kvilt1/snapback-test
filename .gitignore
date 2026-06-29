@@ -1,5 +1,6 @@
 __pycache__/
-input/
+input/*
+!input/.gitkeep
 output/
 .DS_Store
 CLAUDE.md
