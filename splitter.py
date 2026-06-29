@@ -56,6 +56,16 @@ def get_mtime(info):
     return calendar.timegm(info.date_time + (0, 0, -1))
 
 
+def _remove_tree(path):
+    """Remove generated directories, tolerating late filesystem metadata files."""
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def extract_zips(input_dir, tmp_dir, progress):
     """Extract json/ and chat_media/ from zips, preserving real timestamps."""
     zips = sorted(input_dir.glob("*.zip"))
@@ -271,11 +281,71 @@ def match_media(days, media_dir, progress):
     return media_files, overlay_pairs, matched
 
 
-def _media_type(ext):
-    """Map file extension to a media type string."""
-    ext = ext.lower().lstrip(".")
+_MP4_CONTAINER_BOXES = {b"moov", b"trak", b"mdia"}
+_MEDIA_FOLDERS = {"IMAGE": "image", "VIDEO": "video", "AUDIO": "audio"}
+
+
+def _mp4_media_type(path):
+    """Classify MP4 audio/video from handler boxes without reading media payloads."""
+    audio_found = False
+
+    try:
+        with path.open("rb") as fp:
+            file_size = fp.seek(0, os.SEEK_END)
+
+            def walk(start, end):
+                nonlocal audio_found
+                pos = start
+                while pos + 8 <= end:
+                    fp.seek(pos)
+                    header = fp.read(8)
+                    if len(header) < 8:
+                        return None
+
+                    size = int.from_bytes(header[:4], "big")
+                    box_type = header[4:8]
+                    header_size = 8
+                    if size == 1:
+                        large_size = fp.read(8)
+                        if len(large_size) < 8:
+                            return None
+                        size = int.from_bytes(large_size, "big")
+                        header_size = 16
+                    elif size == 0:
+                        size = end - pos
+
+                    if size < header_size or pos + size > end:
+                        return None
+
+                    payload_start, box_end = pos + header_size, pos + size
+                    if box_type == b"hdlr":
+                        fp.seek(payload_start + 8)
+                        handler = fp.read(4)
+                        if handler == b"vide":
+                            return "VIDEO"
+                        if handler == b"soun":
+                            audio_found = True
+                    elif box_type in _MP4_CONTAINER_BOXES and walk(payload_start, box_end) == "VIDEO":
+                        return "VIDEO"
+
+                    pos += size
+                return None
+
+            if walk(0, file_size) == "VIDEO":
+                return "VIDEO"
+    except OSError:
+        return None
+
+    return "AUDIO" if audio_found else None
+
+
+def _media_type(path):
+    """Map a media path to a media type string."""
+    ext = path.suffix.lower().lstrip(".")
     if ext in ("jpg", "jpeg", "png", "gif", "webp"):
         return "IMAGE"
+    if ext == "mp4":
+        return _mp4_media_type(path) or "VIDEO"
     if ext in ("mp4", "mov", "avi", "webm"):
         return "VIDEO"
     if ext in ("mp3", "aac", "m4a", "wav", "ogg"):
@@ -297,15 +367,17 @@ def _copy_message_media(m, media_dir, folder, overlay_pairs):
         copied.add(fname)
 
         if fname in overlay_pairs:
-            dest = folder / "media" / src.stem
+            dest = folder / "media" / "overlay" / src.stem
             dest.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest / fname)
             shutil.copy2(overlay_pairs[fname], dest / overlay_pairs[fname].name)
-            rel_paths.append(f"media/{src.stem}")
+            rel_paths.append(f"media/overlay/{src.stem}")
         else:
-            (folder / "media").mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, folder / "media" / fname)
-            rel_paths.append(f"media/{fname}")
+            media_folder = _MEDIA_FOLDERS[_media_type(src)]
+            dest = folder / "media" / media_folder
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest / fname)
+            rel_paths.append(f"media/{media_folder}/{fname}")
 
     if rel_paths:
         m["media_locations"] = rel_paths
@@ -325,7 +397,7 @@ def _collect_orphans(day, media_by_day, day_mapped, folder):
             orphaned.append({
                 "path": f"orphaned/{fname}",
                 "filename": fname,
-                "type": _media_type(ext),
+                "type": _media_type(f),
                 "extension": ext,
             })
     return orphaned
@@ -335,7 +407,7 @@ def write_output(days, overlay_pairs, media_dir, out, group_titles, all_media_fi
     """Write a single conversations.json per day with stats and orphaned media."""
     days_out = out / "days"
     if days_out.exists():
-        shutil.rmtree(days_out)
+        _remove_tree(days_out)
 
     media_by_day = defaultdict(dict)
     for f in all_media_files:
@@ -443,7 +515,7 @@ def main():
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     input_dir, tmp_dir = Path("input"), Path("_tmp_extract")
     if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
+        _remove_tree(tmp_dir)
 
     progress = Progress()
     extract_zips(input_dir, tmp_dir, progress)
@@ -479,7 +551,7 @@ def main():
     )
     progress.close()
 
-    shutil.rmtree(tmp_dir)
+    _remove_tree(tmp_dir)
     min_date, max_date = min(days.keys()), max(days.keys())
     len_days, total_media = len(days), len(media_files)
     orphaned = total_media - matched
